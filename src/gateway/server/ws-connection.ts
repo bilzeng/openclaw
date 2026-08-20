@@ -658,7 +658,6 @@ export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnecti
         socket,
         connId,
         service: workerConnectionService,
-        isStartupPending,
         send,
         close,
         isClosed: () => closed,
