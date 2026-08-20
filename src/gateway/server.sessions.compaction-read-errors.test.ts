@@ -35,7 +35,13 @@ function requireTranscriptReader(): LoadTranscriptEvents {
   return transcriptReads.actual;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  if (!transcriptReads.actual) {
+    const actual = await vi.importActual<
+      typeof import("../config/sessions/session-accessor.sqlite-read.js")
+    >("../config/sessions/session-accessor.sqlite-read.js");
+    transcriptReads.actual = actual.loadTranscriptEvents;
+  }
   transcriptReads.load.mockReset();
   transcriptReads.load.mockImplementation(requireTranscriptReader());
 });
