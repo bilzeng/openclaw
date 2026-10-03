@@ -4,6 +4,7 @@ import type {
 } from "../../../packages/gateway-protocol/src/schema/push.ts";
 import type { GatewayBrowserClient } from "../api/gateway.ts";
 import { formatUiError } from "../lib/format-error.ts";
+import type { ConnectionBootstrapCoordinator } from "./connection-bootstrap.ts";
 import type { ApplicationGateway } from "./gateway.ts";
 
 const SW_READY_TIMEOUT = 10_000;
@@ -80,12 +81,7 @@ function requirePushManager(registration: ServiceWorkerRegistration): PushManage
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
   const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
-  const raw = atob(base64);
-  const output = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i += 1) {
-    output[i] = raw.charCodeAt(i);
-  }
-  return output;
+  return Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
 }
 
 export async function getExistingSubscription(): Promise<PushSubscription | null> {
@@ -98,8 +94,10 @@ export async function getExistingSubscription(): Promise<PushSubscription | null
 }
 
 async function resolveGatewayVapidPublicKey(client: GatewayBrowserClient): Promise<Uint8Array> {
-  const vapidRes = await client.request("push.web.vapidPublicKey", {});
-  const vapidPublicKey = (vapidRes as { vapidPublicKey: string }).vapidPublicKey;
+  const { vapidPublicKey } = await client.request<{ vapidPublicKey: string }>(
+    "push.web.vapidPublicKey",
+    {},
+  );
   if (!vapidPublicKey) {
     throw new Error("Failed to retrieve VAPID public key");
   }
@@ -175,6 +173,7 @@ async function reconcileWebPushCapability(
 }
 
 export function startWebPushReconciliation(params: {
+  connectionBootstrap?: ConnectionBootstrapCoordinator;
   gateway: ApplicationGateway;
   publish: (patch: WebPushCapabilityPatch) => void;
 }): () => void {
@@ -206,7 +205,11 @@ export function startWebPushReconciliation(params: {
     const currentGeneration = ++generation;
     params.publish({ subscription: "unknown", preferences: null, error: null });
     if (client) {
-      void reconcile(client, currentGeneration);
+      const reconcileCurrentClient = () => reconcile(client, currentGeneration);
+      void (
+        params.connectionBootstrap?.run("web-push-reconcile", reconcileCurrentClient) ??
+        reconcileCurrentClient()
+      ).catch(() => undefined);
     }
   };
   const stopGateway = params.gateway.subscribe(handleGateway);
@@ -218,8 +221,7 @@ export function startWebPushReconciliation(params: {
       !client ||
       !payload ||
       typeof payload !== "object" ||
-      !("profileId" in payload) ||
-      payload.profileId !== params.gateway.snapshot.selfUser?.id ||
+      !params.gateway.snapshot.selfUser?.id ||
       !("keys" in payload) ||
       !Array.isArray(payload.keys) ||
       !payload.keys.includes(WEB_PUSH_USER_PREFERENCES_KEY)
@@ -238,6 +240,7 @@ export function startWebPushReconciliation(params: {
 }
 
 export function createWebPushCapabilityRuntime(params: {
+  connectionBootstrap?: ConnectionBootstrapCoordinator;
   gateway: ApplicationGateway;
   publish: (patch: WebPushCapabilityPatch) => void;
 }): WebPushCapabilityRuntime {
@@ -334,10 +337,6 @@ export async function unsubscribeFromWebPush(client: GatewayBrowserClient): Prom
   await subscription.unsubscribe();
 }
 
-export async function sendTestWebPush(client: GatewayBrowserClient): Promise<void> {
-  await client.request("push.web.test", {});
-}
-
 async function requireExistingSubscription(): Promise<PushSubscription> {
   const subscription = await getExistingSubscription();
   if (!subscription) {
@@ -346,32 +345,16 @@ async function requireExistingSubscription(): Promise<PushSubscription> {
   return subscription;
 }
 
-export async function getWebPushPreferences(
+async function getWebPushPreferences(
   client: GatewayBrowserClient,
 ): Promise<WebPushPreferencesResult> {
   const subscription = await requireExistingSubscription();
-  const result = await client.request("push.web.preferences.get", {
+  return await client.request<WebPushPreferencesResult>("push.web.preferences.get", {
     endpoint: subscription.endpoint,
   });
-  // SAFETY: the Gateway validates and owns the closed preferences result contract.
-  return result as WebPushPreferencesResult;
 }
 
-export async function setWebPushPreferences(
-  client: GatewayBrowserClient,
-  scope: "user" | "device",
-  preferences: WebPushNotificationPreferences | WebPushDevicePreferences,
-): Promise<WebPushPreferencesResult> {
-  const subscription = await requireExistingSubscription();
-  await client.request("push.web.preferences.set", {
-    endpoint: subscription.endpoint,
-    scope,
-    preferences,
-  });
-  return await getWebPushPreferences(client);
-}
-
-export async function runWebPushCapabilityAction(
+async function runWebPushCapabilityAction(
   client: GatewayBrowserClient,
   action: WebPushCapabilityAction,
 ): Promise<WebPushCapabilityPatch> {
@@ -382,12 +365,17 @@ export async function runWebPushCapabilityAction(
       await unsubscribeFromWebPush(client);
       return { subscription: "missing", preferences: null };
     case "test":
-      await sendTestWebPush(client);
+      await client.request("push.web.test", {});
       return {};
-    case "set":
-      return {
-        preferences: await setWebPushPreferences(client, action.scope, action.preferences),
-      };
+    case "set": {
+      const subscription = await requireExistingSubscription();
+      await client.request("push.web.preferences.set", {
+        endpoint: subscription.endpoint,
+        scope: action.scope,
+        preferences: action.preferences,
+      });
+      return { preferences: await getWebPushPreferences(client) };
+    }
     default:
       return action satisfies never;
   }

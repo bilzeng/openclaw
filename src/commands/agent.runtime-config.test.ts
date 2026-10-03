@@ -111,6 +111,7 @@ const prepareSecretsRuntimeSnapshotMock = vi.hoisted(() =>
       config: params.assignmentConfig,
       authStores: [],
       authStoreCredentialsRevision: 0,
+      authStoreSnapshotsRevision: 0,
       warnings: [],
       webTools: {},
     }),
@@ -215,37 +216,17 @@ describe("agentCommand runtime config", () => {
   it("sets runtime snapshots from source config before embedded agent run", async () => {
     await withTempHome(async (home) => {
       const store = path.join(home, "sessions.json");
-      const loadedConfig = {
-        agents: {
-          defaults: {
-            model: { primary: "anthropic/claude-opus-4-6" },
-            models: { "anthropic/claude-opus-4-6": {} },
-            workspace: path.join(home, "openclaw"),
+      const loadedConfig = mockConfig(home, store);
+      loadedConfig.models = {
+        providers: {
+          openai: {
+            baseUrl: "https://api.openai.com/v1",
+            apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
+            models: [],
           },
         },
-        session: { store, mainKey: "main" },
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      } as unknown as OpenClawConfig;
-      const sourceConfig = {
-        ...loadedConfig,
-        models: {
-          providers: {
-            openai: {
-              baseUrl: "https://api.openai.com/v1",
-              apiKey: { source: "env", provider: "default", id: "OPENAI_API_KEY" }, // pragma: allowlist secret
-              models: [],
-            },
-          },
-        },
-      } as unknown as OpenClawConfig;
+      };
+      const sourceConfig = structuredClone(loadedConfig);
       const resolvedConfig = {
         ...loadedConfig,
         models: {
@@ -288,7 +269,7 @@ describe("agentCommand runtime config", () => {
       expect(targetIds.has("models.providers.*.apiKey")).toBe(true);
       expect(targetIds.has("channels.telegram.botToken")).toBe(false);
       expect(setRuntimeConfigSnapshotMock).toHaveBeenCalledWith(resolvedConfig, sourceConfig);
-      expect(prepared.cfg).toBe(resolvedConfig);
+      expect(prepared).toBe(resolvedConfig);
     });
   });
 
@@ -440,9 +421,7 @@ describe("agentCommand runtime config", () => {
       expect(readConfigFileSnapshotForWriteMock).not.toHaveBeenCalled();
       expect(resolveCommandConfigWithSecretsMock).not.toHaveBeenCalled();
       expect(setRuntimeConfigSnapshotMock).not.toHaveBeenCalled();
-      expect(prepared.cfg).toBe(loadedConfig);
-      expect(prepared.sourceConfig).toEqual(loadedConfig);
-      expect(prepared.sourceConfig).not.toBe(loadedConfig);
+      expect(prepared).toBe(loadedConfig);
     });
   });
 

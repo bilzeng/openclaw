@@ -1,4 +1,3 @@
-// Raft gateway lifecycle owns the loopback-only wake endpoint and bridge child process.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
@@ -12,8 +11,10 @@ import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 import { createChannelReplayGuard } from "openclaw/plugin-sdk/persistent-dedupe";
 import { killProcessTree } from "openclaw/plugin-sdk/process-runtime";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   readJsonBodyWithLimit,
+  sendHttpRequestRejection,
   WEBHOOK_BODY_READ_DEFAULTS,
 } from "openclaw/plugin-sdk/webhook-request-guards";
 import { RAFT_CHANNEL_ID, type ResolvedRaftAccount } from "./accounts.js";
@@ -51,26 +52,7 @@ type RaftBridgeProcess = Pick<ChildProcess, "pid"> & Pick<EventEmitter, "once">;
 
 type RaftWakeReplayEvent = { accountId: string; key: string };
 
-function createRaftWakeReplayGuard(params?: {
-  env?: NodeJS.ProcessEnv;
-  onDiskError?: (error: unknown) => void;
-}) {
-  return createChannelReplayGuard<RaftWakeReplayEvent>({
-    dedupe: {
-      ttlMs: WAKE_DEDUPE_TTL_MS,
-      memoryMaxSize: WAKE_DEDUPE_MEMORY_MAX_SIZE,
-      pluginId: RAFT_CHANNEL_ID,
-      namespacePrefix: "raft-wake-dedupe",
-      stateMaxEntries: WAKE_DEDUPE_STATE_MAX_ENTRIES,
-      ...(params?.env ? { env: params.env } : {}),
-      ...(params?.onDiskError ? { onDiskError: params.onDiskError } : {}),
-    },
-    buildReplayKey: (event) => event.key,
-    namespace: (event) => event.accountId,
-  });
-}
-
-type RaftWakeReplayGuard = ReturnType<typeof createRaftWakeReplayGuard>;
+type RaftWakeReplayGuard = ReturnType<typeof createChannelReplayGuard<RaftWakeReplayEvent>>;
 
 type RaftGatewayDeps = {
   createToken?: () => string;
@@ -82,14 +64,11 @@ class WakeRequestError extends Error {
   constructor(
     readonly statusCode: number,
     message: string,
+    /** Body-limit rejections own the connection, so their answer goes through the transport. */
     readonly closeAfterResponse = false,
   ) {
     super(message);
   }
-}
-
-function createToken(): string {
-  return randomBytes(32).toString("hex");
 }
 
 function spawnRaftBridge(params: {
@@ -149,10 +128,10 @@ async function readWakePayload(request: IncomingMessage): Promise<Record<string,
     );
   }
   const payload = body.value;
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  if (!isRecord(payload)) {
     throw new WakeRequestError(400, "Wake payload must be an object.");
   }
-  return payload as Record<string, unknown>;
+  return payload;
 }
 
 function containsMessageContent(value: unknown): boolean {
@@ -162,7 +141,7 @@ function containsMessageContent(value: unknown): boolean {
   if (!value || typeof value !== "object") {
     return false;
   }
-  return Object.entries(value as Record<string, unknown>).some(
+  return Object.entries(value).some(
     ([key, child]) =>
       FORBIDDEN_WAKE_CONTENT_KEYS.has(key.toLowerCase()) || containsMessageContent(child),
   );
@@ -181,13 +160,9 @@ function resolveWakeEventId(payload: Record<string, unknown>): string | undefine
   return undefined;
 }
 
-function hashWakeEventId(eventId: string): string {
-  return createHash("sha256").update(eventId).digest("hex");
-}
-
 function resolveWakeDedupeKey(payload: Record<string, unknown>): string | undefined {
   const eventId = resolveWakeEventId(payload);
-  return eventId ? hashWakeEventId(`id:${eventId}`) : undefined;
+  return eventId ? createHash("sha256").update(`id:${eventId}`).digest("hex") : undefined;
 }
 
 function sendJson(response: ServerResponse, statusCode: number, body: Record<string, unknown>) {
@@ -251,16 +226,30 @@ export async function startRaftGatewayAccount(
   const wakeQueue = new KeyedAsyncQueue();
   const wakeDedupe =
     deps.wakeDedupe ??
-    createRaftWakeReplayGuard({
-      onDiskError: (error) => {
-        ctx.log?.warn?.(`Raft wake dedupe storage failed: ${String(error)}`);
+    createChannelReplayGuard<RaftWakeReplayEvent>({
+      dedupe: {
+        ttlMs: WAKE_DEDUPE_TTL_MS,
+        memoryMaxSize: WAKE_DEDUPE_MEMORY_MAX_SIZE,
+        pluginId: RAFT_CHANNEL_ID,
+        namespacePrefix: "raft-wake-dedupe",
+        stateMaxEntries: WAKE_DEDUPE_STATE_MAX_ENTRIES,
+        onDiskError: (error) => {
+          ctx.log?.warn?.(`Raft wake dedupe storage failed: ${String(error)}`);
+        },
       },
+      buildReplayKey: (event) => event.key,
+      namespace: (event) => event.accountId,
     });
-  const token = (deps.createToken ?? createToken)();
+  const token = deps.createToken ? deps.createToken() : randomBytes(32).toString("hex");
   const runtimeSession = randomUUID();
   const sockets = new Set<Socket>();
   let stopped = false;
   let bridgeExited: Error | undefined;
+  const assertWakeActive = () => {
+    if (stopped || bridgeExited || ctx.abortSignal?.aborted) {
+      throw new WakeRequestError(503, "Raft Gateway is stopping.");
+    }
+  };
   const server = createServer((request, response) => {
     void (async () => {
       if (request.method === "GET" && request.url === HEALTH_PATH) {
@@ -295,6 +284,7 @@ export async function startRaftGatewayAccount(
       }
 
       const payload = await readWakePayload(request);
+      assertWakeActive();
       if (containsMessageContent(payload)) {
         throw new WakeRequestError(400, "Wake payload must not include message content.");
       }
@@ -311,12 +301,11 @@ export async function startRaftGatewayAccount(
         throw new WakeRequestError(400, "Wake payload must include a stable event identity.");
       }
       const dispatched = await wakeQueue.enqueue(ctx.accountId, async () => {
-        if (ctx.abortSignal?.aborted) {
-          throw new WakeRequestError(503, "Raft Gateway is stopping.");
-        }
+        assertWakeActive();
         const result = await wakeDedupe.processGuarded(
           { accountId: ctx.accountId, key: dedupeKey },
           async () => {
+            assertWakeActive();
             await dispatchRaftWake({ ctx });
           },
         );
@@ -337,23 +326,26 @@ export async function startRaftGatewayAccount(
         runtimeSession,
         ...(dispatched ? {} : { duplicate: true }),
       });
-    })().catch((error: unknown) => {
+    })().catch(async (error: unknown) => {
       const statusCode = error instanceof WakeRequestError ? error.statusCode : 500;
       const message = error instanceof WakeRequestError ? error.message : "Internal server error.";
       ctx.log?.warn?.(`Raft wake request rejected: ${message}`);
-      if (!response.headersSent) {
-        if (error instanceof WakeRequestError && error.closeAfterResponse) {
-          response.setHeader("Connection", "close");
-          response.once("close", () => {
-            if (!request.destroyed) {
-              request.destroy();
-            }
-          });
-        }
-        sendJson(response, statusCode, { error: message });
-      } else {
+      if (response.headersSent) {
         response.destroy();
+        return;
       }
+      if (error instanceof WakeRequestError && error.closeAfterResponse) {
+        response.setHeader("cache-control", "no-store");
+        await sendHttpRequestRejection(
+          request,
+          response,
+          statusCode,
+          JSON.stringify({ error: message }),
+          "application/json; charset=utf-8",
+        );
+        return;
+      }
+      sendJson(response, statusCode, { error: message });
     });
   });
   server.on("connection", (socket) => {
@@ -422,6 +414,8 @@ export async function startRaftGatewayAccount(
     stopped = true;
     requestBridgeStop();
     closeServer(server, sockets);
+    // Admission is closed; join dispatch and its replay settlement before retiring the account.
+    await wakeQueue.enqueue(ctx.accountId, async () => {});
     ctx.setStatus({
       accountId: ctx.accountId,
       running: false,

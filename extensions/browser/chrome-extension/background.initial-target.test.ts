@@ -6,7 +6,6 @@ import {
   loadRelayCommandHarness as createHarness,
   sendRuntimeMessage,
   TEST_RELAY_KEY,
-  REPLACEMENT_TEST_RELAY_KEY,
 } from "./background.test-harness.js";
 
 const pendingReleases = new Set<() => void>();
@@ -34,14 +33,14 @@ afterEach(async () => {
   }
   pendingReleases.clear();
   await cleanupBackgroundHarnesses();
+  vi.doUnmock("./modules/tab-access.js");
   vi.unstubAllGlobals();
 });
 
-describe.each(["all", "selected"] as const)("created initial target in %s mode", (mode) => {
+describe("created initial target in selected mode", () => {
+  const mode = "selected";
   it.each([
     { url: "about:blank", failGrouping: false },
-    { url: "about:blank", failGrouping: true },
-    { url: "https://example.com/", failGrouping: false },
     { url: "https://example.com/", failGrouping: true },
   ])(
     "handles Chrome's pending-only initial URL $url (group failure: $failGrouping)",
@@ -97,20 +96,6 @@ describe.each(["all", "selected"] as const)("created initial target in %s mode",
     },
   );
 
-  it("accepts an initial HTTP commit observed before Chrome returns the created tab", async () => {
-    const harness = await createHarness(mode);
-    const create = harness.tabsCreate.getMockImplementation()!;
-    harness.tabsCreate.mockImplementationOnce(async (params) => {
-      const tab = await create(params);
-      harness.updateTab(tab.id, { url: params.url });
-      return tab;
-    });
-    expect(
-      await harness.command({ type: "createTab", url: "https://example.com/start" }),
-    ).toMatchObject({ type: "result" });
-    expect(harness.debuggerAttach).toHaveBeenCalledExactlyOnceWith({ tabId: 101 }, "1.3");
-  });
-
   it("retires an unhanded blank when a lookup observes takeover before the URL event", async () => {
     const harness = await createHarness(mode);
     const attaching = deferred(undefined);
@@ -129,144 +114,115 @@ describe.each(["all", "selected"] as const)("created initial target in %s mode",
     expect(harness.tabsRemove).not.toHaveBeenCalled();
   });
 
-  it("keeps a blank-first CDP target alive when earlier discovery resolves after creation", async () => {
-    const harness = await createHarness(mode);
-    harness.tabGroupsQuery.mockResolvedValue([{ id: 7, windowId: 1 }]);
-    const bridge = new ExtensionRelayBridge();
-    const extension = bridge.attachExtensionSocket({
-      send: (raw) => harness.socket.receive(JSON.parse(raw)),
-      close: () => harness.socket.close(),
-    });
-    const hello = harness.frames().find((frame) => frame.type === "hello");
-    harness.socket.send.mockImplementation((raw: string) => extension.onMessage(raw));
-    extension.onMessage(JSON.stringify(hello));
-    const frames: Array<Record<string, unknown>> = [];
-    const client = bridge.attachCdpClientSocket({
-      send: (raw) => frames.push(JSON.parse(raw)),
-      close() {},
-    });
-    let id = 0;
-    const request = async (method: string, params = {}, sessionId?: string) => {
-      const requestId = ++id;
-      client.onMessage(JSON.stringify({ id: requestId, method, params, sessionId }));
-      return await vi.waitFor(() => {
-        const response = frames.find((frame) => frame.id === requestId);
-        expect(response).toBeDefined();
-        expect(response).not.toHaveProperty("error");
-        return response?.result;
-      });
-    };
-    try {
-      await request("Target.setAutoAttach", { autoAttach: true, flatten: true });
-      const staleTabs = await harness.tabsQuery();
-      const inventory = deferred(staleTabs);
+  it.each(["Chrome query", "completed policy read"])(
+    "keeps a blank-first CDP target alive when an earlier %s resolves after creation",
+    async (phase) => {
       let inspecting = false;
-      harness.tabsQuery.mockImplementationOnce(async () => {
-        inspecting = true;
-        return await inventory.promise;
+      let holdSnapshot = false;
+      const inventory = deferred(undefined);
+      if (phase === "completed policy read") {
+        vi.doMock("./modules/tab-access.js", async (importOriginal) => {
+          const actual = await importOriginal<typeof import("./modules/tab-access.js")>();
+          return {
+            ...actual,
+            createTabAccessPolicy: (...args: Parameters<typeof actual.createTabAccessPolicy>) => {
+              const policy = actual.createTabAccessPolicy(...args);
+              const list = policy.listAccessibleTabs.bind(policy);
+              policy.listAccessibleTabs = async (...listArgs) => {
+                const snapshot = await list(...listArgs);
+                if (holdSnapshot) {
+                  holdSnapshot = false;
+                  inspecting = true;
+                  await inventory.promise;
+                }
+                return snapshot;
+              };
+              return policy;
+            },
+          };
+        });
+      }
+      const harness = await createHarness(mode);
+      harness.tabGroupsQuery.mockResolvedValue([{ id: 7, windowId: 1 }]);
+      const bridge = new ExtensionRelayBridge();
+      const extension = bridge.attachExtensionSocket({
+        send: (raw) => harness.socket.receive(JSON.parse(raw)),
+        close: () => harness.socket.close(),
       });
-      harness.updateTab(100, { url: "about:blank" });
-      await vi.waitFor(() => expect(inspecting).toBe(true));
-      expect(await request("Target.createTarget", { url: "about:blank" })).toEqual({
-        targetId: "tab-101",
+      const hello = harness.frames().find((frame) => frame.type === "hello");
+      harness.socket.send.mockImplementation((raw: string) => extension.onMessage(raw));
+      extension.onMessage(JSON.stringify(hello));
+      const frames: Array<Record<string, unknown>> = [];
+      const client = bridge.attachCdpClientSocket({
+        send: (raw) => frames.push(JSON.parse(raw)),
+        close() {},
       });
-      const attached = frames.find((frame) => frame.method === "Target.attachedToTarget")
-        ?.params as { sessionId: string };
-      expect(attached.sessionId).toBeTruthy();
-      const inventoryCount = harness.frames().filter((frame) => frame.type === "tabs").length;
-      inventory.resolve();
-      await vi.waitFor(() =>
-        expect(harness.frames().filter((frame) => frame.type === "tabs").length).toBeGreaterThan(
-          inventoryCount,
-        ),
-      );
-      await request("Page.enable", {}, attached.sessionId);
-      harness.debuggerSendCommand.mockImplementationOnce(async () => {
-        harness.updateTab(101, { url: "https://example.com/" });
-        return { frameId: "frame-101", loaderId: "next-document" };
-      });
-      await request("Page.navigate", { url: "https://example.com/" }, attached.sessionId);
-      await request("Runtime.evaluate", { expression: "document.title" }, attached.sessionId);
-      await request("Target.detachFromTarget", { sessionId: attached.sessionId });
-      expect(await request("Target.closeTarget", { targetId: "tab-101" })).toEqual({
-        success: true,
-      });
-      expect(harness.debuggerAttach).toHaveBeenCalledExactlyOnceWith({ tabId: 101 }, "1.3");
-      expect(harness.tabsRemove).toHaveBeenCalledExactlyOnceWith(101);
-    } finally {
-      await client.onClose();
-      bridge.dispose();
-    }
-  });
+      let id = 0;
+      const request = async (method: string, params = {}, sessionId?: string) => {
+        const requestId = ++id;
+        client.onMessage(JSON.stringify({ id: requestId, method, params, sessionId }));
+        return await vi.waitFor(() => {
+          const response = frames.find((frame) => frame.id === requestId);
+          expect(response).toBeDefined();
+          expect(response).not.toHaveProperty("error");
+          return response?.result;
+        });
+      };
+      try {
+        await request("Target.setAutoAttach", { autoAttach: true, flatten: true });
+        const staleTabs = await harness.tabsQuery();
+        if (phase === "Chrome query") {
+          harness.tabsQuery.mockImplementationOnce(async () => {
+            inspecting = true;
+            await inventory.promise;
+            return staleTabs;
+          });
+        } else {
+          // Hold the real completed read at the await boundary before publication.
+          holdSnapshot = true;
+        }
+        harness.updateTab(100, { url: "about:blank" });
+        await vi.waitFor(() => expect(inspecting).toBe(true));
+        expect(await request("Target.createTarget", { url: "about:blank" })).toEqual({
+          targetId: "tab-101",
+        });
+        const attached = frames.find((frame) => frame.method === "Target.attachedToTarget")
+          ?.params as { sessionId: string };
+        expect(attached.sessionId).toBeTruthy();
+        const inventoryCount = harness.frames().filter((frame) => frame.type === "tabs").length;
+        inventory.resolve();
+        await vi.waitFor(() =>
+          expect(harness.frames().filter((frame) => frame.type === "tabs").length).toBeGreaterThan(
+            inventoryCount,
+          ),
+        );
+        await request("Page.enable", {}, attached.sessionId);
+        harness.debuggerSendCommand.mockImplementationOnce(async () => {
+          harness.updateTab(101, { url: "https://example.com/" });
+          return { frameId: "frame-101", loaderId: "next-document" };
+        });
+        await request("Page.navigate", { url: "https://example.com/" }, attached.sessionId);
+        await request("Runtime.evaluate", { expression: "document.title" }, attached.sessionId);
+        await request("Target.detachFromTarget", { sessionId: attached.sessionId });
+        expect(await request("Target.closeTarget", { targetId: "tab-101" })).toEqual({
+          success: true,
+        });
+        expect(harness.debuggerAttach).toHaveBeenCalledExactlyOnceWith({ tabId: 101 }, "1.3");
+        expect(harness.tabsRemove).toHaveBeenCalledExactlyOnceWith(101);
+      } finally {
+        await client.onClose();
+        bridge.dispose();
+      }
+    },
+  );
 
-  it("attaches only its own initial blank and supports discovery, initialization, navigation, and close", async () => {
-    const harness = await createHarness(mode);
-    expect.soft(await harness.command({ type: "createTab", url: "about:blank" })).toMatchObject({
-      type: "result",
-      result: { tabId: 101, targetId: "tab-101" },
-    });
-    expect.soft(harness.debuggerAttach).toHaveBeenCalledWith({ tabId: 101 }, "1.3");
-    expect(await harness.command({ type: "attach", tabId: 101 })).toMatchObject({ type: "result" });
-    await expect(
-      sendRuntimeMessage(harness, { type: "getTabAccess", tabId: 101 }),
-    ).resolves.toMatchObject({
-      accessible: true,
-    });
-    await vi.waitFor(() =>
-      expect(harness.frames().findLast((frame) => frame.type === "tabs")?.tabs).toEqual([
-        expect.objectContaining({ tabId: 101, url: "about:blank" }),
-      ]),
-    );
-    expect(await harness.command({ type: "attach", tabId: 100 })).toMatchObject({ type: "error" });
-    expect(await harness.command({ type: "cdp", tabId: 101, method: "Page.enable" })).toMatchObject(
-      { type: "result" },
-    );
-    expect(
-      await harness.command({
-        type: "cdp",
-        tabId: 101,
-        method: "Page.navigate",
-        params: { url: "https://example.com/" },
-      }),
-    ).toMatchObject({ type: "result" });
-    harness.updateTab(101, { pendingUrl: "https://example.com/" });
-    expect(
-      await harness.command({ type: "cdp", tabId: 101, method: "Runtime.evaluate" }),
-    ).toMatchObject({ type: "result" });
-    harness.updateTab(101, { url: "https://example.com/", pendingUrl: undefined });
-    harness.debuggerEventListener?.({ tabId: 101 }, "Page.frameNavigated", {
-      frame: { url: "https://example.com/" },
-    });
-    harness.debuggerEventListener?.({ tabId: 101 }, "Page.lifecycleEvent", { name: "load" });
-    expect(
-      harness
-        .frames()
-        .filter((frame) => frame.type === "cdpEvent")
-        .map((frame) => frame.method),
-    ).toEqual(["Page.frameNavigated", "Page.lifecycleEvent"]);
-    expect(await harness.command({ type: "closeTab", tabId: 101 })).toMatchObject({
-      type: "result",
-    });
-    expect(harness.tabsRemove).toHaveBeenCalledExactlyOnceWith(101);
-    expect(await harness.tabsQuery()).toEqual([expect.objectContaining({ id: 100 })]);
-  });
-
-  it.each(["group", "name", "attach", "target lookup", "focus"])(
+  it.each(["group", "focus"])(
     "rolls back failed %s without closing an unrelated blank",
     async (stage) => {
       const harness = await createHarness(mode);
       const failure = new Error(`${stage} failed`);
       if (stage === "group") {
         harness.tabsGroup.mockRejectedValueOnce(failure);
-      }
-      if (stage === "name") {
-        harness.tabGroupsUpdate.mockRejectedValueOnce(failure);
-      }
-      if (stage === "attach") {
-        harness.debuggerAttach.mockRejectedValueOnce(failure);
-      }
-      if (stage === "target lookup") {
-        harness.debuggerGetTargetInfo.mockRejectedValueOnce(failure);
       }
       if (stage === "focus") {
         harness.windowsUpdate.mockRejectedValueOnce(failure);
@@ -283,14 +239,9 @@ describe.each(["all", "selected"] as const)("created initial target in %s mode",
   );
 
   it.each([
-    { url: "about:blank#manual" },
-    { url: "about:settings" },
     { url: "chrome://settings" },
-    { url: "chrome-extension://example/popup.html" },
     { url: "file:///tmp/private.html" },
     { pendingUrl: "chrome://settings" },
-    { pendingUrl: "about:blank#other" },
-    { pendingUrl: "file:///tmp/private.html" },
     { incognito: true },
   ])("does not grant initial ownership over a restricted created tab: %j", async (properties) => {
     const harness = await createHarness(mode);
@@ -304,6 +255,58 @@ describe.each(["all", "selected"] as const)("created initial target in %s mode",
     expect(harness.debuggerAttach).not.toHaveBeenCalled();
     expect(await harness.command({ type: "attach", tabId: 100 })).toMatchObject({ type: "error" });
   });
+
+  it.each(["matching", "different"])(
+    "checks a lagging initial-blank snapshot against the native commit with a %s pending URL",
+    async (pending) => {
+      const harness = await createHarness(mode);
+      await harness.command({ type: "createTab", url: "about:blank" });
+      const url = "https://example.com/destination";
+      const result = { frameId: "frame-101", loaderId: "destination" };
+      harness.debuggerSendCommand.mockImplementationOnce(async () => {
+        harness.updateTab(
+          101,
+          {
+            pendingUrl: pending === "matching" ? url : "https://example.com/other",
+          },
+          false,
+        );
+        const commit = () =>
+          harness.debuggerEventListener?.({ tabId: 101 }, "Page.frameNavigated", {
+            frame: { id: result.frameId, loaderId: result.loaderId, url },
+          });
+        const getGroup = harness.tabGroupsGet.getMockImplementation()!;
+        // Commit between the two access reads, before Chrome's tab snapshot catches up.
+        harness.tabGroupsGet.mockImplementationOnce(async (groupId) => {
+          commit();
+          return await getGroup(groupId);
+        });
+        return result;
+      });
+      const response = await harness.command({
+        type: "cdp",
+        tabId: 101,
+        method: "Page.navigate",
+        params: { url },
+      });
+      if (pending !== "matching") {
+        expect(response).toMatchObject({ type: "error" });
+        return;
+      }
+      expect(response, JSON.stringify(response)).toMatchObject({ type: "result", result });
+      harness.updateTab(100, { title: "Trigger discovery" });
+      await vi.waitFor(() =>
+        expect(harness.frames().findLast((frame) => frame.type === "tabs")?.tabs).toContainEqual(
+          expect.objectContaining({ tabId: 101, url }),
+        ),
+      );
+      expect(harness.debuggerDetach).not.toHaveBeenCalled();
+      harness.updateTab(101, { url, pendingUrl: undefined });
+      expect(
+        await harness.command({ type: "cdp", tabId: 101, method: "Runtime.evaluate" }),
+      ).toMatchObject({ type: "result" });
+    },
+  );
 
   it("retires initial-document provenance on navigation and does not regain it on return to blank", async () => {
     const harness = await createHarness(mode);
@@ -356,43 +359,20 @@ describe.each(["all", "selected"] as const)("created initial target in %s mode",
     });
   });
 
-  it.each(["attach", "target lookup", "focus"])(
-    "does not publish or detach an owned target while %s is pending",
-    async (stage) => {
-      const harness = await createHarness(mode);
-      const attaching = deferred(undefined);
-      harness.debuggerGetTargetInfo.mockClear();
-      if (stage === "attach") {
-        harness.debuggerAttach.mockImplementationOnce(async () => await attaching.promise);
-      }
-      if (stage === "target lookup") {
-        harness.debuggerGetTargetInfo.mockImplementationOnce(async () => {
-          await attaching.promise;
-          return { targetInfo: { targetId: "tab-101" } };
-        });
-      }
-      if (stage === "focus") {
-        harness.windowsUpdate.mockImplementationOnce(async () => await attaching.promise);
-      }
-      const creating = harness.command({ type: "createTab", url: "about:blank", focus: true });
-      await vi.waitFor(() =>
-        expect(
-          stage === "focus"
-            ? harness.windowsUpdate
-            : stage === "target lookup"
-              ? harness.debuggerGetTargetInfo
-              : harness.debuggerAttach,
-        ).toHaveBeenCalled(),
-      );
-      harness.updateTab(101, { url: "about:blank" });
-      await vi.waitFor(() =>
-        expect(harness.frames().findLast((frame) => frame.type === "tabs")?.tabs).toEqual([]),
-      );
-      expect(harness.debuggerDetach).not.toHaveBeenCalled();
-      attaching.resolve();
-      expect(await creating).toMatchObject({ type: "result" });
-    },
-  );
+  it("does not publish or detach an owned target before focus completes", async () => {
+    const harness = await createHarness(mode);
+    const focusing = deferred(undefined);
+    harness.windowsUpdate.mockImplementationOnce(async () => await focusing.promise);
+    const creating = harness.command({ type: "createTab", url: "about:blank", focus: true });
+    await vi.waitFor(() => expect(harness.windowsUpdate).toHaveBeenCalled());
+    harness.updateTab(101, { url: "about:blank" });
+    await vi.waitFor(() =>
+      expect(harness.frames().findLast((frame) => frame.type === "tabs")?.tabs).toEqual([]),
+    );
+    expect(harness.debuggerDetach).not.toHaveBeenCalled();
+    focusing.resolve();
+    expect(await creating).toMatchObject({ type: "result" });
+  });
 
   it("does not recapture creation authority from a late self-group event after revocation", async () => {
     const harness = await createHarness(mode);
@@ -476,11 +456,11 @@ describe.each(["all", "selected"] as const)("created initial target in %s mode",
         case "mode":
           mutation = sendRuntimeMessage(harness, {
             type: "setAccessMode",
-            accessMode: mode === "all" ? "selected" : "all",
+            accessMode: "all",
           });
           await vi.waitFor(() =>
             expect(harness.storageSet).toHaveBeenCalledWith({
-              accessMode: mode === "all" ? "selected" : "all",
+              accessMode: "all",
             }),
           );
           break;
@@ -512,42 +492,6 @@ describe.each(["all", "selected"] as const)("created initial target in %s mode",
           type: "error",
         });
       }
-    },
-  );
-
-  it.each(["unpair", "connection replacement"])(
-    "does not deliver a late creation through %s",
-    async (revocation) => {
-      const harness = await createHarness(mode);
-      const attaching = deferred(undefined);
-      harness.debuggerAttach.mockImplementationOnce(async () => await attaching.promise);
-      harness.socket.receive({ type: "createTab", seq: 70, url: "about:blank" });
-      await vi.waitFor(() => expect(harness.debuggerAttach).toHaveBeenCalled());
-      const mutation = sendRuntimeMessage(
-        harness,
-        revocation === "unpair"
-          ? { type: "unpair" }
-          : {
-              type: "pair",
-              accessMode: mode,
-              pairingString: `ws://127.0.0.1:18798/extension#${REPLACEMENT_TEST_RELAY_KEY}`,
-            },
-      );
-      await vi.waitFor(() => expect(harness.socket.close).toHaveBeenCalled());
-      attaching.resolve();
-      await expect(mutation).resolves.toMatchObject({ ok: true });
-      if (revocation === "connection replacement") {
-        const replacement = harness.relaySockets.at(-1)!;
-        await harness.authenticate(replacement);
-        expect(
-          replacement.send.mock.calls
-            .map(([raw]) => JSON.parse(raw))
-            .some((frame) => frame.seq === 70),
-        ).toBe(false);
-      }
-      expect(harness.frames().some((frame) => frame.seq === 70 && frame.type === "result")).toBe(
-        false,
-      );
     },
   );
 

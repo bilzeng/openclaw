@@ -73,8 +73,7 @@ export class SettingsManager {
 
   /** Create a SettingsManager that loads from files */
   static create(cwd: string, agentDir: string = getAgentDir()): SettingsManager {
-    const storage = new FileSettingsStorage(cwd, agentDir);
-    return SettingsManager.fromStorage(storage);
+    return SettingsManager.fromStorage(new FileSettingsStorage(cwd, agentDir));
   }
 
   /** Create a SettingsManager from an arbitrary storage backend */
@@ -98,10 +97,14 @@ export class SettingsManager {
   private static loadScope(storage: SettingsStorage, scope: SettingsScope): SettingsScopeState {
     let content: string | undefined;
     try {
-      storage.withLock(scope, (current) => {
-        content = current;
-        return undefined;
-      });
+      if (storage.readSettingsScope) {
+        content = storage.readSettingsScope(scope);
+      } else {
+        storage.withLock(scope, (current) => {
+          content = current;
+          return undefined;
+        });
+      }
       const settings = content
         ? SettingsManager.migrateSettings(JSON.parse(content) as Record<string, unknown>)
         : {};
@@ -230,17 +233,6 @@ export class SettingsManager {
     this.errors.push({ scope, error: normalizedError });
   }
 
-  private enqueueWrite(scope: SettingsScope, task: () => void): void {
-    this.writeQueue = this.writeQueue
-      .then(() => {
-        task();
-        this.scopes[scope].modified.clear();
-      })
-      .catch((error: unknown) => {
-        this.recordError(scope, error);
-      });
-  }
-
   private persistScopedSettings(
     scope: SettingsScope,
     snapshotSettings: Settings,
@@ -280,9 +272,14 @@ export class SettingsManager {
     const modified = new Map(
       [...state.modified].map(([field, nested]) => [field, nested && new Set(nested)]),
     );
-    this.enqueueWrite(scope, () => {
-      this.persistScopedSettings(scope, snapshotSettings, modified);
-    });
+    this.writeQueue = this.writeQueue
+      .then(() => {
+        this.persistScopedSettings(scope, snapshotSettings, modified);
+        state.modified.clear();
+      })
+      .catch((error: unknown) => {
+        this.recordError(scope, error);
+      });
   }
 
   private setScopedSetting<K extends keyof Settings>(
@@ -313,7 +310,7 @@ export class SettingsManager {
   }
 
   drainErrors(): SettingsError[] {
-    const drained = [...this.errors];
+    const drained = this.errors;
     this.errors = [];
     return drained;
   }

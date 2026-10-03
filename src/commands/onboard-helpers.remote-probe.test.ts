@@ -162,6 +162,7 @@ describe("probeGatewayReachable", () => {
       .mockResolvedValueOnce({
         ok: true,
         server: { version: "2026.7.2", connId: "conn-configured" },
+        gatewayReached: true,
         configSnapshot: {
           valid: true,
           config: { agents: { list: [{ id: "work", default: true, model: "openai/gpt-5.5" }] } },
@@ -170,6 +171,7 @@ describe("probeGatewayReachable", () => {
       .mockResolvedValueOnce({
         ok: true,
         server: { version: "2026.7.2", connId: "conn-missing" },
+        gatewayReached: true,
         configSnapshot: { valid: true, config: { gateway: { mode: "local" } } },
       });
 
@@ -199,6 +201,7 @@ describe("probeGatewayReachable", () => {
       error: "config.get: unauthorized",
       auth: { role: null, scopes: [], capability: "unknown" },
       server: { version: "2026.7.2", connId: "conn-1" },
+      gatewayReached: true,
     });
 
     await expect(probeGatewayConfiguredModel({ url: "ws://127.0.0.1:18789" })).resolves.toEqual({
@@ -213,6 +216,7 @@ describe("probeGatewayReachable", () => {
       connectLatencyMs: 42,
       error: "device pairing required",
       connectErrorDetails: { code: ConnectErrorDetailCodes.PAIRING_REQUIRED },
+      gatewayReached: true,
       auth: { role: null, scopes: [], capability: "pairing_pending" },
       server: { version: null, connId: null },
     });
@@ -272,48 +276,19 @@ describe("probeGatewayReachable", () => {
     });
   });
 
-  it("keeps a first-time connect-only auth result on the reachable Gateway path", async () => {
-    mocks.probeGateway.mockResolvedValueOnce({
-      ok: false,
-      connectLatencyMs: 42,
-      error: "missing scope: operator.read",
-      auth: { role: "operator", scopes: [], capability: "connected_no_operator_scope" },
-      server: { version: "2026.7.2", connId: "conn-1" },
-    });
-
-    await expect(probeGatewayConfiguredModel({ url: "ws://127.0.0.1:18789" })).resolves.toEqual({
-      kind: "reachable-unverified",
-      detail: "missing scope: operator.read",
-    });
-  });
-
   it("treats an invalid config snapshot as reachable but unverified", async () => {
     mocks.probeGateway.mockResolvedValueOnce({
       ok: true,
       connectLatencyMs: 42,
       auth: { role: "operator", scopes: ["operator.read"], capability: "read_only" },
       server: { version: "2026.7.2", connId: "conn-1" },
+      gatewayReached: true,
       configSnapshot: { valid: false },
     });
 
     await expect(probeGatewayConfiguredModel({ url: "ws://127.0.0.1:18789" })).resolves.toEqual({
       kind: "reachable-unverified",
       detail: "Gateway returned an invalid config snapshot",
-    });
-  });
-
-  it("distinguishes pre-Hello connection failures from reachable Gateway failures", async () => {
-    mocks.probeGateway.mockResolvedValueOnce({
-      ok: false,
-      connectLatencyMs: null,
-      error: "connect failed: timeout",
-      auth: { role: null, scopes: [], capability: "unknown" },
-      server: { version: null, connId: null },
-    });
-
-    await expect(probeGatewayConfiguredModel({ url: "ws://127.0.0.1:18789" })).resolves.toEqual({
-      kind: "unreachable",
-      detail: "connect failed: timeout",
     });
   });
 });

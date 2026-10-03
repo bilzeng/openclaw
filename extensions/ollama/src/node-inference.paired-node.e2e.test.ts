@@ -1,7 +1,6 @@
 // Proves local Ollama inference crosses a real Gateway and paired node socket.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -9,6 +8,7 @@ import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { GatewayClient } from "openclaw/plugin-sdk/gateway-runtime";
 import type { OpenClawPluginNodeHostCommand } from "openclaw/plugin-sdk/plugin-entry";
+import { createCanonicalAgentConfigFixture, stopChildProcess } from "openclaw/plugin-sdk/test-env";
 import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { describe, expect, it, vi } from "vitest";
 import { createOllamaNodeHostCommands } from "./node-inference.js";
@@ -60,35 +60,39 @@ describe("Ollama paired-node Gateway inference", () => {
       let node: GatewayClient | undefined;
 
       try {
-        await state.writeConfig({
-          gateway: {
-            mode: "local",
-            port: gatewayPort,
-            bind: "loopback",
-            auth: { mode: "token", token: gatewayToken },
-            controlUi: { enabled: false },
-            nodes: { commands: { allow: ["ollama.models", "ollama.chat"] } },
-          },
-          plugins: {
-            allow: ["ollama"],
-          },
-          agents: {
-            defaults: { heartbeat: { every: "0m" }, skipBootstrap: true },
-            entries: { main: { default: true, tools: { allow: ["node_inference"] } } },
-          },
-          models: {
-            providers: {
-              ollama: { api: "ollama", baseUrl: gatewayOllama.baseUrl, models: [] },
+        await state.writeConfig(
+          createCanonicalAgentConfigFixture({
+            gateway: {
+              mode: "local",
+              port: gatewayPort,
+              bind: "loopback",
+              auth: { mode: "token", token: gatewayToken },
+              controlUi: { enabled: false },
+              nodes: { commands: { allow: ["ollama.models", "ollama.chat"] } },
             },
-          },
-        });
+            plugins: {
+              allow: ["ollama"],
+            },
+            agents: {
+              defaults: { heartbeat: { every: "0m" }, skipBootstrap: true },
+              entries: { main: { default: true, tools: { allow: ["node_inference"] } } },
+            },
+            models: {
+              providers: {
+                ollama: { api: "ollama", baseUrl: gatewayOllama.baseUrl, models: [] },
+              },
+            },
+          }).config,
+        );
 
+        const gatewayEntryArgs =
+          process.env.OPENCLAW_E2E_USE_PREBUILT_DIST === "1"
+            ? ["dist/entry.js"]
+            : ["--import", "tsx", "src/entry.ts"];
         gateway = spawn(
           process.execPath,
           [
-            "--import",
-            "tsx",
-            "src/entry.ts",
+            ...gatewayEntryArgs,
             "gateway",
             "--port",
             String(gatewayPort),
@@ -270,10 +274,18 @@ describe("Ollama paired-node Gateway inference", () => {
           ...(node ? [node.stopAndWait({ timeoutMs: 1000 })] : []),
           ...(operator ? [operator.stopAndWait({ timeoutMs: 1000 })] : []),
         ]);
-        if (gateway) {
-          await stopGatewayProcess(gateway);
+        try {
+          if (gateway) {
+            await stopChildProcess(gateway, 2_000).catch(async (error: unknown) => {
+              // The child keeps its copied env and retained files; join the parent's
+              // state work before restoring selectors for the next fixture.
+              await state.restoreEnv();
+              throw error;
+            });
+          }
+        } finally {
+          await Promise.allSettled([nodeOllama.close(), gatewayOllama.close()]);
         }
-        await Promise.allSettled([nodeOllama.close(), gatewayOllama.close()]);
         await state.cleanup();
       }
     },
@@ -638,17 +650,4 @@ async function handleFakeOllamaRequest(
   }
   response.statusCode = 404;
   response.end(JSON.stringify({ error: "not found" }));
-}
-
-async function stopGatewayProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return;
-  }
-  const exited = once(child, "exit").then(() => true);
-  child.kill("SIGTERM");
-  if (await Promise.race([exited, delay(2_000).then(() => false)])) {
-    return;
-  }
-  child.kill("SIGKILL");
-  await Promise.race([exited, delay(2_000)]);
 }

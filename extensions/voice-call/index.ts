@@ -3,7 +3,9 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { ErrorCodes, errorShape } from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveGlobalSingleton } from "openclaw/plugin-sdk/global-singleton";
+import type { PluginServiceSchedulerV1 } from "openclaw/plugin-sdk/plugin-entry";
 import { normalizeAgentId, parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
+import { resolvePluginServiceScheduler } from "openclaw/plugin-sdk/runtime";
 import {
   asNonArrayRecord as asParamRecord,
   asOptionalRecord,
@@ -18,7 +20,6 @@ import {
 } from "./api.js";
 import { VOICE_CALL_CLI_DESCRIPTOR } from "./cli-output-mode.js";
 import { createVoiceCallRuntime, type VoiceCallRuntime } from "./runtime-entry.js";
-import { registerVoiceCallCli } from "./src/cli.js";
 import {
   createVoiceCallCommandService,
   VoiceCallCommandInputError,
@@ -96,6 +97,7 @@ const VOICE_CALL_RUNTIME_COORDINATOR_KEY = Symbol.for("openclaw.voice-call.runti
 
 type VoiceCallRuntimeGeneration = {
   retired: boolean;
+  scheduler?: PluginServiceSchedulerV1;
   serviceHealth?: Parameters<
     Parameters<OpenClawPluginApi["registerService"]>[0]["start"]
   >[0]["serviceHealth"];
@@ -264,7 +266,14 @@ export default definePluginEntry({
           return createdRuntime;
         }
 
+        const scheduler = runtimeGeneration.scheduler;
+        if (!scheduler || scheduler.signal.aborted) {
+          throw new VoiceCallRuntimeLifecycleError(
+            "Voice call service is not running; start the Gateway and retry",
+          );
+        }
         const runtimePromise = createVoiceCallRuntime({
+          scheduler,
           config,
           coreConfig: api.config as OpenClawConfig,
           fullConfig: api.config,
@@ -547,19 +556,25 @@ export default definePluginEntry({
     }));
 
     api.registerCli(
-      ({ program }) =>
+      async ({ program }) => {
+        const { registerVoiceCallCli } = await import("./src/cli.js");
         registerVoiceCallCli({
           program,
           config,
-          ensureRuntime,
+          coreConfig: api.config,
+          ensureRuntime: () => {
+            runtimeRegistration.generation.scheduler = resolvePluginServiceScheduler();
+            return ensureRuntime();
+          },
           stateRuntime: api.runtime.state,
-          logger: api.logger,
-        }),
+        });
+      },
       { commands: ["voicecall"], descriptors: [VOICE_CALL_CLI_DESCRIPTOR] },
     );
 
     api.registerService({
       id: "voicecall",
+      apiVersion: 2,
       start: (ctx) => {
         if (isCliOnlyProcess()) {
           return;
@@ -573,6 +588,7 @@ export default definePluginEntry({
             }
             runtimeRegistration.generation = { retired: false };
           }
+          runtimeRegistration.generation.scheduler = ctx.scheduler;
           runtimeRegistration.generation.serviceHealth = ctx.serviceHealth;
           activateRuntimeGeneration(runtimeRegistration.generation);
         } catch (err) {
@@ -604,6 +620,7 @@ export default definePluginEntry({
         try {
           await stopVoiceCallRuntimeGeneration(runtimeCoordinator, runtimeGeneration);
         } finally {
+          runtimeGeneration.scheduler = undefined;
           runtimeGeneration.serviceHealth = undefined;
         }
       },

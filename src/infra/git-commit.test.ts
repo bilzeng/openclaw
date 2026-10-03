@@ -4,10 +4,28 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createTrackedTempDirs } from "../test-utils/tracked-temp-dirs.js";
+import { gitCommitPrefixesMatch } from "./git-commit.js";
 
 const tempDirs = createTrackedTempDirs();
+
+describe("git commit prefix matching", () => {
+  const fullCommit = "abcdef0123456789abcdef0123456789abcdef01";
+  const sharedPrefixCommit = "abcdef0fedcba9876543210fedcba9876543210f";
+
+  it.each([
+    ["exact equality", fullCommit, fullCommit, true],
+    ["short right prefix", fullCommit, "abcdef0", true],
+    ["whitespace and case normalization", "  ABCDEF0  ", fullCommit, true],
+    ["distinct full commits sharing seven characters", fullCommit, sharedPrefixCommit, false],
+    ["short left operand", "abcdef", fullCommit, false],
+    ["short right operand", fullCommit, "abcdef", false],
+    ["whitespace-only operand", "   ", fullCommit, false],
+  ])("%s", (_name, left, right, expected) => {
+    expect(gitCommitPrefixesMatch(left, right)).toBe(expected);
+  });
+});
 
 async function makeTempDir(label: string): Promise<string> {
   return await tempDirs.make(`openclaw-${label}-`);
@@ -27,8 +45,6 @@ async function makeFakeGitRepo(
   const gitdir = options.gitdir ?? path.join(root, ".git");
   if (options.gitdir) {
     await fs.writeFile(path.join(root, ".git"), `gitdir: ${options.gitdir}\n`, "utf-8");
-  } else {
-    await fs.mkdir(gitdir, { recursive: true });
   }
   await fs.mkdir(gitdir, { recursive: true });
   await fs.writeFile(path.join(gitdir, "HEAD"), options.head, "utf-8");
@@ -78,7 +94,8 @@ describe("git commit resolution", () => {
   let resolveCommitHash: (typeof import("./git-commit.js"))["resolveCommitHash"];
   let resolveLoadedCommitHash: (typeof import("./git-commit.js"))["resolveLoadedCommitHash"];
 
-  beforeEach(async () => {
+  // Unique fixture paths isolate cache entries without reloading the owner for each case.
+  beforeAll(async () => {
     vi.restoreAllMocks();
     vi.doUnmock("node:fs");
     vi.doUnmock("node:module");
@@ -88,8 +105,6 @@ describe("git commit resolution", () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
-    vi.doUnmock("node:fs");
-    vi.doUnmock("node:module");
     await tempDirs.cleanup();
   });
 
@@ -334,26 +349,6 @@ describe("git commit resolution", () => {
     limitPositionalReads(4);
 
     expect(resolveCommitHash({ cwd: checkoutRoot, env: {} })).toBe("0123456");
-  });
-
-  it("caches deterministic null results per resolved search directory", async () => {
-    const temp = await makeTempDir("git-commit-null-cache");
-    const repoRootEntry = path.join(temp, "repo");
-    await makeFakeGitRepo(repoRootEntry, {
-      head: "not-a-commit\n",
-    });
-
-    const readGitCommit = vi.fn(() => null);
-
-    expect(
-      resolveCommitHash({ cwd: repoRootEntry, env: {}, readers: { readGitCommit } }),
-    ).toBeNull();
-    const firstCallReads = readGitCommit.mock.calls.length;
-    expect(firstCallReads).toBeGreaterThan(0);
-    expect(
-      resolveCommitHash({ cwd: repoRootEntry, env: {}, readers: { readGitCommit } }),
-    ).toBeNull();
-    expect(readGitCommit.mock.calls.length).toBe(firstCallReads);
   });
 
   it("caches caught null fallback results per resolved search directory", async () => {

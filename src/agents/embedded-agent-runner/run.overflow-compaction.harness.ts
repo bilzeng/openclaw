@@ -1,16 +1,18 @@
 /**
  * Test harness mocks for embedded-run overflow compaction coverage.
  */
+
 import { matchesContextOverflowMessage } from "@openclaw/ai/internal/runtime";
 import { type Mock, vi } from "vitest";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
-import type { ContextEngineSessionTarget } from "../../context-engine/types.js";
+import type { ContextEngine, ContextEngineSessionTarget } from "../../context-engine/types.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import type { ClaimingHookAdmission } from "../../plugins/hook-claim-admission.js";
 import type {
   PluginHookBeforeAgentFinalizeEvent,
   PluginHookBeforeAgentFinalizeResult,
 } from "../../plugins/hook-types.js";
-import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
+import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
 import { getActivePluginRegistry } from "../../plugins/runtime.js";
 import type {
   PluginHookAgentContext,
@@ -21,13 +23,19 @@ import type {
 import { resetCommandQueueStateForTest } from "../../process/command-queue.test-support.js";
 import type { OpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import type { AuthProfileStore } from "../auth-profiles/types.js";
+import { createNativeModelOwnedRuntimeModel } from "../defaults.js";
 import { extractObservedOverflowTokenCount } from "../embedded-agent-helpers/context-overflow-observation.js";
 import type { FailoverReason } from "../failover/signal.js";
 import { clearAgentHarnesses, registerAgentHarness } from "../harness/registry.js";
 import type { AgentHarnessAttemptParams } from "../harness/types.js";
 import type { ResolvedProviderAuth } from "../model-auth-runtime-shared.js";
+import { preparedModelRuntimeConfigsMatch } from "../prepared-model-runtime.owner.js";
+import type {
+  PreparedModelRuntimeInput,
+  PreparedModelRuntimeLeaseOptions,
+} from "../prepared-model-runtime.types.js";
 import type { AgentRuntimePlan } from "../runtime-plan/types.js";
-import { makeAttemptResult } from "./run.overflow-compaction.fixture.js";
+import { makeAttemptResult, makeMockRuntimePlan } from "./run.overflow-compaction.fixture.js";
 import type { RunEmbeddedAgentInternalParams } from "./run/internal-params.js";
 import type { buildEmbeddedRunPayloads } from "./run/payloads.js";
 import type { EmbeddedRunAttemptResult } from "./run/types.js";
@@ -76,46 +84,7 @@ type MockResolvedModel = {
   reasoning?: boolean;
 };
 
-const emptyPluginIndex: PluginMetadataSnapshot["index"] = {
-  version: 1,
-  hostContractVersion: "test",
-  compatRegistryVersion: "test",
-  migrationVersion: 1,
-  policyHash: "",
-  generatedAtMs: 1,
-  installRecords: {},
-  plugins: [],
-  diagnostics: [],
-};
-const emptyPluginMetadataSnapshot: PluginMetadataSnapshot = {
-  policyHash: "",
-  index: emptyPluginIndex,
-  registryIndex: emptyPluginIndex,
-  registryDiagnostics: [],
-  manifestRegistry: { plugins: [], diagnostics: [] },
-  plugins: [],
-  diagnostics: [],
-  byPluginId: new Map(),
-  normalizePluginId: (pluginId: string) => pluginId,
-  owners: {
-    channels: new Map(),
-    channelConfigs: new Map(),
-    providers: new Map(),
-    modelCatalogProviders: new Map(),
-    cliBackends: new Map(),
-    setupProviders: new Map(),
-    commandAliases: new Map(),
-    contracts: new Map(),
-  },
-  metrics: {
-    registrySnapshotMs: 0,
-    manifestRegistryMs: 0,
-    ownerMapsMs: 0,
-    totalMs: 0,
-    indexPluginCount: 0,
-    manifestPluginCount: 0,
-  },
-};
+const emptyPluginMetadataSnapshot = createPluginMetadataSnapshotFixture();
 
 type MockAgentDiscoveryStores = {
   authStorage: {
@@ -126,6 +95,7 @@ type MockAgentDiscoveryStores = {
 
 type MockResolveModelResult = MockAgentDiscoveryStores & {
   model: MockResolvedModel;
+  logicalRef: { provider: string; model: string };
   error: null;
 };
 
@@ -134,7 +104,7 @@ export const mockedGlobalHookRunner = {
   runBeforeAgentReply: vi.fn(
     async (
       _eventValue: { cleanedBody: string },
-      _ctx: PluginHookAgentContext,
+      _ctx: PluginHookAgentContext & ClaimingHookAdmission,
     ): Promise<PluginHookBeforeAgentReplyResult | undefined> => undefined,
   ),
   runBeforeAgentFinalize: vi.fn(
@@ -168,46 +138,39 @@ const mockedContextEngine = {
   })),
 };
 
-type MockRuntimePlan = Pick<AgentRuntimePlan, "auth"> & {
-  observability: Pick<AgentRuntimePlan["observability"], "harnessId">;
-};
-
-function makeMockRuntimePlan(): MockRuntimePlan {
-  return {
-    auth: {
-      authProfileProviderForAuth: "openai",
-      providerForAuth: "openai",
-    },
-    observability: {
-      harnessId: "codex",
-    },
-  };
-}
-
 export const mockedCompactDirect = mockedContextEngine.compact;
 const mockedResolveContextEngine = vi.fn(async () => mockedContextEngine);
 const mockedResolveContextEngineOwnerPluginId = vi.fn(() => undefined);
 const buildMockAgentRuntimePlan = () => makeMockRuntimePlan() as AgentRuntimePlan;
 export const mockedBuildAgentRuntimePlan = vi.fn<() => AgentRuntimePlan>(buildMockAgentRuntimePlan);
 export const mockedAcquireAgentRunPreparedModelRuntime = vi.fn(
-  async (input: Record<string, unknown>) => {
-    const pluginRegistry = getActivePluginRegistry();
+  async (input: PreparedModelRuntimeInput, options?: PreparedModelRuntimeLeaseOptions) => {
+    const admitted = options?.pluginGeneration;
+    const pluginRegistry = admitted ? admitted.pluginRegistry : getActivePluginRegistry();
+    const metadataSnapshot = admitted
+      ? admitted.pluginMetadataSnapshot
+      : { ...emptyPluginMetadataSnapshot, workspaceDir: input.workspaceDir };
+    const snapshot = {
+      agentId: input.agentId,
+      agentDir: input.agentDir,
+      config: input.config,
+      workspaceDir: input.workspaceDir,
+      pluginRegistry: pluginRegistry
+        ? { ...pluginRegistry, agentHarnesses: [...pluginRegistry.agentHarnesses] }
+        : undefined,
+      metadataSnapshot,
+      createStores: () => ({ authStorage: {}, modelRegistry: {} }),
+    };
     return {
-      snapshot: {
-        agentId: input.agentId,
-        agentDir: input.agentDir,
-        config: input.config,
-        workspaceDir: input.workspaceDir,
-        pluginRegistry: pluginRegistry
-          ? {
-              ...pluginRegistry,
-              agentHarnesses: [...pluginRegistry.agentHarnesses],
-            }
-          : undefined,
-        metadataSnapshot: { ...emptyPluginMetadataSnapshot, workspaceDir: input.workspaceDir },
-        createStores: () => ({ authStorage: {}, modelRegistry: {} }),
+      snapshot,
+      pluginGeneration: admitted ?? {
+        remoteCatalog: null,
+        pluginMetadataSnapshot: metadataSnapshot,
+        pluginRegistry: snapshot.pluginRegistry,
+        configuredCatalogEntries: [],
+        inlineProviderModels: [],
       },
-      release: vi.fn(),
+      [Symbol.asyncDispose]: vi.fn(async () => {}),
     };
   },
 );
@@ -235,6 +198,7 @@ function createMockResolvedModel(
   )?.models?.providers?.[provider];
   const usesOpenAITransport = provider === "openai" || provider === "codex";
   return {
+    logicalRef: { provider, model: modelId },
     model: {
       id: modelId,
       provider,
@@ -343,10 +307,6 @@ const mockedIsAuthAssistantError = vi.fn(() => false);
 const mockedIsBillingAssistantError = vi.fn(() => false);
 export const mockedIsCompactionFailureError = vi.fn(() => false);
 export const mockedIsFailoverAssistantError = vi.fn<MockAssistantErrorProbe>(() => false);
-const mockedIsFailoverErrorMessage = vi.fn(() => false);
-const mockedIsGenericUnknownStreamErrorMessage = vi.fn((raw: string) =>
-  /^\s*an unknown error occurred\.?\s*$/i.test(raw),
-);
 function matchesCanonicalOverflowFixture(msg?: string): boolean {
   const raw = msg ?? "";
   return (
@@ -546,14 +506,12 @@ function resetRunOverflowCompactionHarnessMocks(): void {
   mockedCoerceToFailoverError.mockReset();
   mockedCoerceToFailoverError.mockReturnValue(null);
   mockedDescribeFailoverError.mockReset();
-  mockedDescribeFailoverError.mockImplementation(
-    (err: unknown): MockFailoverErrorDescription => ({
-      message: formatErrorMessage(err),
-      reason: undefined,
-      status: undefined,
-      code: undefined,
-    }),
-  );
+  mockedDescribeFailoverError.mockImplementation((err: unknown): MockFailoverErrorDescription => ({
+    message: formatErrorMessage(err),
+    reason: undefined,
+    status: undefined,
+    code: undefined,
+  }));
   mockedResolveFailoverStatus.mockReset();
   mockedResolveFailoverStatus.mockReturnValue(undefined);
 
@@ -585,12 +543,6 @@ function resetRunOverflowCompactionHarnessMocks(): void {
   mockedIsCompactionFailureError.mockReturnValue(false);
   mockedIsFailoverAssistantError.mockReset();
   mockedIsFailoverAssistantError.mockReturnValue(false);
-  mockedIsFailoverErrorMessage.mockReset();
-  mockedIsFailoverErrorMessage.mockReturnValue(false);
-  mockedIsGenericUnknownStreamErrorMessage.mockReset();
-  mockedIsGenericUnknownStreamErrorMessage.mockImplementation((raw: string) =>
-    /^\s*an unknown error occurred\.?\s*$/i.test(raw),
-  );
   mockedIsLikelyContextOverflowError.mockReset();
   mockedIsLikelyContextOverflowError.mockImplementation(matchesCanonicalOverflowFixture);
   mockedParseImageSizeError.mockReset();
@@ -757,6 +709,9 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
     sleepWithAbort: mockedSleepWithAbort,
   }));
   vi.doMock("../../context-engine/registry.js", () => ({
+    hasSameContextEngineInstance: vi.fn(
+      (left: ContextEngine, right: ContextEngine) => left === right,
+    ),
     resolveContextEngine: mockedResolveContextEngine,
     resolveContextEngineOwnerPluginId: mockedResolveContextEngineOwnerPluginId,
     resolveLogicalTurnContextEngines: async () => {
@@ -815,6 +770,7 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
     resolveProviderAuthProfileId: vi.fn(() => undefined),
     resolveProviderReasoningOutputModeWithPlugin: vi.fn(() => undefined),
     shouldPreferProviderRuntimeResolvedModel: vi.fn(() => false),
+    providerOwnsDynamicModelPreparation: vi.fn(() => false),
     prepareProviderExtraParams: vi.fn(async () => ({})),
     wrapProviderStreamFn: vi.fn((_cfg: unknown, _model: unknown, fn: unknown) => fn),
   }));
@@ -822,7 +778,11 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
   // real handle shape without rediscovering every bundled provider plugin.
   vi.doMock("../../plugins/provider-hook-runtime.js", () => ({
     attachModelProviderRuntimePluginHandle: (model: object) => model,
+    resolveLoadedProviderPluginsForHooks: vi.fn(() => undefined),
+    resolveLoadedProviderRuntimePlugin: vi.fn(() => undefined),
     resolveProviderRuntimePluginHandle: vi.fn((params: Record<string, unknown>) => params),
+    resolveProviderHookPlugin: vi.fn(() => undefined),
+    resolveProviderPluginsForHooks: vi.fn(() => []),
   }));
   vi.doMock("../auth-profiles.js", () => ({
     isProfileInCooldown: mockedIsProfileInCooldown,
@@ -904,8 +864,6 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
     isCompactionFailureError: mockedIsCompactionFailureError,
     isLikelyContextOverflowError: mockedIsLikelyContextOverflowError,
     isFailoverAssistantError: mockedIsFailoverAssistantError,
-    isFailoverErrorMessage: mockedIsFailoverErrorMessage,
-    isGenericUnknownStreamErrorMessage: mockedIsGenericUnknownStreamErrorMessage,
     parseImageSizeError: mockedParseImageSizeError,
     parseImageDimensionError: mockedParseImageDimensionError,
     isRateLimitAssistantError: mockedIsRateLimitAssistantError,
@@ -968,6 +926,9 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
   }));
 
   vi.doMock("../prepared-model-runtime.js", () => ({
+    preparedModelRuntimeConfigsMatch,
+    // Standalone runner fixtures have no configured Gateway publication.
+    loadPublishedGatewayReplyDispatchRuntime: vi.fn(async () => undefined),
     activateStandalonePreparedModelRuntime: vi.fn(async () => {}),
     acquireAgentRunPreparedModelRuntime: mockedAcquireAgentRunPreparedModelRuntime,
     acquireReadOnlyPreparedModelRuntime: mockedAcquireAgentRunPreparedModelRuntime,
@@ -995,6 +956,7 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
   });
 
   vi.doMock("../defaults.js", () => ({
+    createNativeModelOwnedRuntimeModel,
     DEFAULT_CONTEXT_TOKENS: 200000,
     DEFAULT_MODEL: "test-model",
     DEFAULT_PROVIDER: "anthropic",

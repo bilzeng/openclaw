@@ -1,5 +1,6 @@
 {
   "id": "venice",
+  "categories": ["models"],
   "activation": {
     "onStartup": false
   },
@@ -7,6 +8,11 @@
   "providers": ["venice"],
   "contracts": {
     "usageProviders": ["venice"]
+  },
+  "modelPricing": {
+    "providers": {
+      "venice": { "venice": { "provider": "venice" } }
+    }
   },
   "providerAuthChoices": [
     {
@@ -39,6 +45,9 @@
     ]
   },
   "modelCatalog": {
+    "modelsDev": {
+      "venice": "venice"
+    },
     "providers": {
       "venice": {
         "baseUrl": "https://api.venice.ai/api/v1",

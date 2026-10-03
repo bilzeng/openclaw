@@ -5,6 +5,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { normalizeChatType, type ChatType } from "../channels/chat-type.js";
 import { parseSqliteSessionEntryRecord } from "../config/sessions/session-entry-json.js";
 import type { SessionEntry } from "../config/sessions/types.js";
+import { SqliteSchemaMismatchError } from "../infra/sqlite-schema-issues.js";
 import { normalizeAccountId } from "../routing/account-id.js";
 import { buildConversationRef, normalizeConversationPeerId } from "../routing/conversation-ref.js";
 import { deriveSessionChatTypeFromKey } from "../sessions/session-chat-type-shared.js";
@@ -13,6 +14,85 @@ import { ensurePendingInputConsumptionColumn } from "./openclaw-agent-pending-in
 import { tableExists } from "./openclaw-state-db-schema-helpers.js";
 
 type MigratedConversationEntry = Record<string, unknown>;
+
+export function assertSupportedAgentMigrationSchemas(
+  db: DatabaseSync,
+  pathname: string,
+  userVersion: number,
+): void {
+  if (
+    (userVersion < 8 &&
+      ["sessions", "session_entries", "transcript_events"].some((table) =>
+        tableExists(db, table),
+      )) ||
+    tableExists(db, "session_transcript_files") ||
+    readSqliteTableColumns(db, "session_transcript_fts")?.has("session_key")
+  ) {
+    throw new SqliteSchemaMismatchError(
+      `OpenClaw agent database ${pathname} contains an unreleased session schema (version ${userVersion}). Preserve a complete copy of your state directory and configuration, including shared agent registration. Run "openclaw doctor --fix" with OpenClaw 2026.9.7 against that copy. If a store is held, follow Doctor's explicit agent-restoration instructions, then rerun Doctor before retrying the upgrade.`,
+    );
+  }
+  const acpParentStreamColumns = readSqliteTableColumns(db, "acp_parent_stream_events");
+  const trajectoryColumns = readSqliteTableColumns(db, "trajectory_runtime_events");
+  const memorySourceColumns = readSqliteTableColumns(db, "memory_index_sources");
+  if (
+    (acpParentStreamColumns && !acpParentStreamColumns.has("session_id")) ||
+    trajectoryColumns?.has("event_id") ||
+    memorySourceColumns?.has("source_kind")
+  ) {
+    throw new SqliteSchemaMismatchError(
+      `OpenClaw agent database ${pathname} has an unsupported legacy schema. Upgrades from pre-July-2026 state are no longer migrated; restore a backup produced by a July 2026 or newer release before retrying.`,
+    );
+  }
+}
+
+/** Backfill one generation token without copying or rewriting transcript rows. */
+export function migrateSessionTranscriptGenerations(
+  db: DatabaseSync,
+  previousVersion: number,
+): void {
+  if (previousVersion >= 13) {
+    return;
+  }
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO transcript_rewrite_watermarks (session_id, generation, updated_at)
+     SELECT session_id, lower(hex(randomblob(16))), ?
+     FROM transcript_events
+     GROUP BY session_id`,
+  );
+  insert.setReadBigInts(true);
+  insert.run(Date.now());
+}
+
+export function migrateSessionTranscriptActiveProjection(
+  db: DatabaseSync,
+  previousVersion: number,
+): void {
+  if (previousVersion >= 10) {
+    return;
+  }
+  const columns = readSqliteTableColumns(db, "session_transcript_index_state");
+  if (columns && !columns.has("active_event_count")) {
+    db.exec(
+      "ALTER TABLE session_transcript_index_state ADD COLUMN active_event_count INTEGER NOT NULL DEFAULT 0;",
+    );
+  }
+  if (columns && !columns.has("active_message_count")) {
+    db.exec(
+      "ALTER TABLE session_transcript_index_state ADD COLUMN active_message_count INTEGER NOT NULL DEFAULT 0;",
+    );
+  }
+  // This table is derived state. Gateway startup rebuilds it after all legacy
+  // imports finish, keeping schema-open work cheap and history reads bounded.
+  db.exec(`
+    DELETE FROM session_transcript_active_events;
+    UPDATE session_transcript_index_state
+    SET needs_rebuild = 1,
+        active_event_count = 0,
+        active_message_count = 0,
+        updated_at = ${Date.now()};
+  `);
+}
 
 function parseConversationEntry(value: unknown): MigratedConversationEntry | undefined {
   return typeof value === "string" ? safeParseJsonRecord(value) : undefined;
@@ -169,14 +249,7 @@ export function backfillSessionConversations(db: DatabaseSync): void {
         ORDER BY se.updated_at ASC, se.session_key ASC;
       `,
     )
-    .all() as Array<{
-    entry_json?: unknown;
-    persisted_chat_type?: unknown;
-    session_key?: unknown;
-    session_id?: unknown;
-    session_scope?: unknown;
-    updated_at?: unknown;
-  }>;
+    .all();
   const upsertConversation = db.prepare(`
     INSERT INTO conversations (
       conversation_id, channel, account_id, kind, peer_id, delivery_target,
@@ -213,6 +286,15 @@ export function backfillSessionConversations(db: DatabaseSync): void {
   const updatePrimary = db.prepare(
     "UPDATE sessions SET primary_conversation_id = ? WHERE session_id = ?",
   );
+  for (const statement of [
+    upsertConversation,
+    deleteMatchingRelated,
+    demotePrimary,
+    linkConversation,
+    updatePrimary,
+  ]) {
+    statement.setReadBigInts(true);
+  }
   for (const row of rows) {
     const sessionId = normalizeOptionalString(row.session_id);
     const entry = parseConversationEntry(row.entry_json);
@@ -262,15 +344,10 @@ export function readSqliteTableColumns(db: DatabaseSync, tableName: string): Set
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName)) {
     throw new Error(`invalid SQLite table identifier: ${tableName}`);
   }
-  const table = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
-    .get(tableName);
-  if (!table) {
+  if (!tableExists(db, tableName)) {
     return null;
   }
-  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{
-    name?: unknown;
-  }>;
+  const rows = db.prepare(`PRAGMA table_info(${tableName})`).all();
   return new Set(rows.flatMap((row) => (typeof row.name === "string" ? [row.name] : [])));
 }
 
@@ -311,6 +388,11 @@ export function ensureSessionAdditiveColumns(db: DatabaseSync): void {
 export function hasPendingSessionConversationRouteContextColumn(db: DatabaseSync): boolean {
   const columns = readSqliteTableColumns(db, "session_conversations");
   return Boolean(columns && !columns.has("route_context_json"));
+}
+
+export function hasPendingSessionProjectColumn(db: DatabaseSync): boolean {
+  const columns = readSqliteTableColumns(db, "session_nodes");
+  return Boolean(columns && !columns.has("project_id"));
 }
 
 export function hasPendingSessionTranscriptContextEligibilityColumn(db: DatabaseSync): boolean {
@@ -362,6 +444,8 @@ export function ensureSessionEntryValidityProjection(db: DatabaseSync): void {
     "SELECT current_session_id, entry_json, session_key, updated_at FROM session_nodes WHERE entry_valid = 0 ORDER BY session_key LIMIT 256",
   );
   const update = db.prepare("UPDATE session_nodes SET entry_valid = ? WHERE session_key = ?");
+  // run() also returns the connection's last insert rowid, including after rollback.
+  update.setReadBigInts(true);
   while (true) {
     // Exhaust the bounded SELECT before updating its source table; SQLite does not define
     // stepping a cursor while the same connection mutates rows visible to that cursor.
@@ -380,31 +464,6 @@ export function ensureSessionEntryValidityProjection(db: DatabaseSync): void {
   }
 }
 
-export function migrateSessionEntryStatusProjection(
-  db: DatabaseSync,
-  readStatus: (entryJson: unknown) => string | null,
-): void {
-  const columns = readSqliteTableColumns(db, "session_entries");
-  if (!columns) {
-    return;
-  }
-  if (!columns.has("status")) {
-    db.exec(
-      "ALTER TABLE session_entries ADD COLUMN status TEXT CHECK (status IS NULL OR status IN ('running', 'done', 'failed', 'killed', 'timeout'));",
-    );
-  }
-  const rows = db.prepare("SELECT session_key, entry_json FROM session_entries").all() as Array<{
-    entry_json?: unknown;
-    session_key?: unknown;
-  }>;
-  const update = db.prepare("UPDATE session_entries SET status = ? WHERE session_key = ?");
-  for (const row of rows) {
-    if (typeof row.session_key === "string") {
-      update.run(readStatus(row.entry_json), row.session_key);
-    }
-  }
-}
-
 export function migrateSessionCreatorNamespaces(db: DatabaseSync, previousVersion: number): void {
   if (previousVersion >= 19 || !tableExists(db, "session_nodes")) {
     return;
@@ -412,6 +471,7 @@ export function migrateSessionCreatorNamespaces(db: DatabaseSync, previousVersio
   const update = db.prepare(
     "UPDATE session_nodes SET entry_json = ?, created_actor_type = ?, created_actor_id = ? WHERE session_key = ?",
   );
+  update.setReadBigInts(true);
   const rows = db.prepare(`SELECT session_key, entry_json FROM session_nodes
     WHERE json_valid(entry_json) AND (json_extract(entry_json, '$.createdActor.type') = 'human'
       OR (json_type(entry_json, '$.createdActor') IS NULL AND json_type(entry_json, '$.createdBy') = 'object'))`);
